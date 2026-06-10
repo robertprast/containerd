@@ -38,7 +38,6 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	crilabels "github.com/containerd/containerd/v2/internal/cri/labels"
 	"github.com/containerd/containerd/v2/internal/cri/server/restore"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
@@ -53,7 +52,6 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 
-	"github.com/distribution/reference"
 	"github.com/opencontainers/image-spec/identity"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
@@ -123,7 +121,6 @@ func (c *criService) CRImportCheckpoint(
 
 	inputImage := meta.Config.Image.Image
 	createAnnotations := meta.Config.Annotations
-	createLabels := meta.Config.Labels
 
 	restoreStorageImageID, err := c.checkIfCheckpointOCIImage(ctx, inputImage)
 	if err != nil {
@@ -239,74 +236,63 @@ func (c *criService) CRImportCheckpoint(
 		return "", fmt.Errorf("failed to read %q: %w", crmetadata.StatusDumpFile, err)
 	}
 
+	// The target sandbox is policy and policy comes from the live request,
+	// never from the checkpoint: letting spec.dump pick the sandbox would let
+	// the checkpoint author choose which pod the process is revived into.
 	if meta.SandboxID == "" {
-		// restore into previous sandbox
-		meta.SandboxID = dumpSpec.Annotations[annotations.SandboxID]
-		ctrID = config.ID
-	} else {
-		ctrID = ""
-	}
-
-	ctrMetadata := runtime.ContainerMetadata{}
-
-	if meta.Config.Metadata != nil && meta.Config.Metadata.Name != "" {
-		ctrMetadata.Name = containerStatus.GetMetadata().GetName()
+		return "", errors.New("restore: target sandbox must come from the live create request, not the checkpoint")
 	}
 
 	originalAnnotations := containerStatus.GetAnnotations()
 	if originalAnnotations == nil {
 		originalAnnotations = make(map[string]string)
 	}
-	originalLabels := containerStatus.GetLabels()
 
 	sandboxUID := sandboxConfig.GetMetadata().GetUid()
-
 	if sandboxUID != "" {
-		if _, ok := originalLabels[crilabels.KubernetesPodUIDLabel]; ok {
-			originalLabels[crilabels.KubernetesPodUIDLabel] = sandboxUID
-		}
 		if _, ok := originalAnnotations[crilabels.KubernetesPodUIDLabel]; ok {
 			originalAnnotations[crilabels.KubernetesPodUIDLabel] = sandboxUID
 		}
 	}
 
-	if createLabels != nil {
-		fixupLabels := []string{
-			// Update the container name. It has already been update in metadata.Name.
-			// It also needs to be updated in the container labels.
-			crilabels.KubernetesContainerNameLabel,
-			// Update pod name in the labels.
-			crilabels.KubernetesPodNameLabel,
-			// Also update namespace.
-			crilabels.KubernetesPodNamespaceLabel,
-		}
-
-		for _, annotation := range fixupLabels {
-			_, ok1 := createLabels[annotation]
-			_, ok2 := originalLabels[annotation]
-
-			// If the value is not set in the original container or
-			// if it is not set in the new container, just skip
-			// the step of updating metadata.
-			if ok1 && ok2 {
-				originalLabels[annotation] = createLabels[annotation]
-			}
-		}
+	// Checkpoint metadata is UNTRUSTED tenant input (P1). Run the restore trust
+	// boundary -- validate, then sanitize -- BEFORE any persistent host-side
+	// effect below (base-image pull, tag write into the shared image store).
+	//
+	// - validate: the built-in metadata validator checks the checkpoint's
+	//   structure and base-image references fail-closed; operators can layer
+	//   signature/provenance validators on top.
+	// - sanitize: create-request annotations are authoritative and only the
+	//   kubelet's own (io.kubernetes.*) bookkeeping keys are restored from the
+	//   checkpoint -- which subsumes the old manual hash/restartCount fixup.
+	//   This drops smuggled runtime-affecting annotations (cdi.k8s.io/,
+	//   devices.nri.io/, containerd.io/restart.*, blockio/rdt classes, ...) at a
+	//   single chokepoint, protecting every downstream consumer (CDI, NRI,
+	//   blockIO/RDT, restart monitor) instead of each sink defending itself.
+	//
+	// See internal/cri/server/restore.
+	checkpoint := &restore.Checkpoint{
+		ImageRef:    inputImage,
+		Annotations: originalAnnotations,
+		Config:      config,
+		Spec:        dumpSpec,
+		Status:      containerStatus,
 	}
-
-	// Checkpoint-origin annotations are UNTRUSTED. Sanitize them against the
-	// restore allowlist: create-request annotations are authoritative, and only
-	// the kubelet's own (io.kubernetes.*) bookkeeping keys are restored from the
-	// checkpoint -- which subsumes the old manual hash/restartCount fixup. This
-	// drops smuggled runtime-affecting annotations (cdi.k8s.io/, devices.nri.io/,
-	// containerd.io/restart.*, blockio/rdt classes, ...) at a single chokepoint,
-	// protecting every downstream consumer (CDI, NRI, blockIO/RDT, restart monitor)
-	// instead of each sink defending itself. See internal/cri/server/restore.
-	sanitized, dropped := restore.SanitizeAnnotations(originalAnnotations, createAnnotations, restore.DefaultAnnotationPolicy())
-	for _, k := range dropped {
+	restorer := restore.New(
+		restore.Policy{
+			Annotations:     restore.DefaultAnnotationPolicy(),
+			RequireVerified: true,
+		},
+		restore.WithValidator(restore.NewMetadataValidator()),
+	)
+	prepared, err := restorer.Prepare(ctx, checkpoint, createAnnotations)
+	if err != nil {
+		return "", err
+	}
+	for _, k := range prepared.DroppedAnnotations {
 		log.G(ctx).Warnf("restore: dropping untrusted checkpoint annotation %q", k)
 	}
-	originalAnnotations = sanitized
+	originalAnnotations = prepared.Annotations
 
 	var containerdImage client.Image
 
@@ -328,9 +314,8 @@ func (c *criService) CRImportCheckpoint(
 		}
 	}
 
-	if _, err := reference.ParseAnyReference(config.RootfsImageName); err != nil {
-		return "", fmt.Errorf("error parsing reference: %q is not a valid repository/tag %v", config.RootfsImageName, err)
-	}
+	// RootfsImageName/RootfsImageRef were validated by the restore metadata
+	// validator (fail closed) before any host-side effect.
 	tagImage, err := c.client.ImageService().Get(ctx, config.RootfsImageRef)
 	if err != nil {
 		return "", fmt.Errorf("failed to get checkpoint base image %s: %w", config.RootfsImageRef, err)
@@ -364,11 +349,11 @@ func (c *criService) CRImportCheckpoint(
 		return "", fmt.Errorf("failed to resolve image %q during checkpoint import: %w", config.RootfsImageName, err)
 	}
 	imageConfig := image.ImageSpec.Config
-	env := append([]string{}, imageConfig.Env...)
+	// Append the live request's env on top of the image env. (The previous
+	// append-to-itself duplicated every image-defined variable.)
 	for _, e := range meta.Config.GetEnvs() {
-		env = append(env, e.GetKey()+"="+e.GetValue())
+		imageConfig.Env = append(imageConfig.Env, e.GetKey()+"="+e.GetValue())
 	}
-	imageConfig.Env = append(imageConfig.Env, env...)
 
 	originalAnnotations["restored"] = "true"
 	originalAnnotations["checkpointedAt"] = config.CheckpointedAt.Format(time.RFC3339Nano)
@@ -398,12 +383,18 @@ func (c *criService) CRImportCheckpoint(
 			podSandboxConfig:      sandboxConfig,
 			sandboxRuntimeHandler: sandbox.Metadata.RuntimeHandler,
 			sandboxPid:            cstatus.Pid,
-			NetNSPath:             sandbox.NetNSPath,
-			containerName:         containerName,
-			containerdImage:       &containerdImage,
-			meta:                  meta,
-			restore:               true,
-			start:                 start,
+			NetNSPath: sandbox.NetNSPath,
+			// The container name comes from the live request's metadata.
+			// (Previously this resolved to the package-level const
+			// containerName = "containerd", mislabeling every restored
+			// container in its CRI spec annotations.)
+			containerName:   meta.Config.GetMetadata().GetName(),
+			containerdImage: &containerdImage,
+			meta:            meta,
+			restore:         true,
+			restorer:        restorer,
+			checkpoint:      checkpoint,
+			start:           start,
 		},
 	)
 	if err != nil {

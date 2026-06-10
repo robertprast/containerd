@@ -20,12 +20,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	crmetadata "github.com/checkpoint-restore/checkpointctl/lib"
+	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
-// Checkpoint is an opaque handle to checkpoint content and its (UNTRUSTED)
-// metadata. In the wiring follow-up this is backed by the unpacked status.dump /
-// config.dump / spec.dump; here only the fields the trust boundary needs are
-// modeled.
+// Checkpoint is a handle to checkpoint content and its (UNTRUSTED) metadata,
+// backed by the unpacked status.dump / config.dump / spec.dump. Every field
+// here is authored by whoever built the checkpoint and MUST NOT reach a
+// host-side decision without validation.
 type Checkpoint struct {
 	// ImageRef is the user-specified checkpoint image or archive reference.
 	ImageRef string
@@ -33,6 +37,16 @@ type Checkpoint struct {
 	// These are attacker-authored and MUST NOT be trusted; they are passed
 	// through [SanitizeAnnotations] before reaching any container config.
 	Annotations map[string]string
+	// Config is the checkpoint's config.dump metadata (base image refs,
+	// recorded runtime, checkpoint timestamps). UNTRUSTED.
+	Config *crmetadata.ContainerConfig
+	// Spec is the checkpoint's spec.dump (the OCI spec of the checkpointed
+	// container). UNTRUSTED: it reflects the policy of the original container
+	// as asserted by the checkpoint author, never the policy of the restore.
+	Spec *runtimespec.Spec
+	// Status is the checkpoint's status.dump (the CRI container status at
+	// checkpoint time). UNTRUSTED.
+	Status *runtime.ContainerStatus
 }
 
 // SpecMutator is the (narrow) view of the in-construction OCI spec that a

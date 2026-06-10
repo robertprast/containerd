@@ -42,6 +42,7 @@ import (
 	cio "github.com/containerd/containerd/v2/internal/cri/io"
 	crilabels "github.com/containerd/containerd/v2/internal/cri/labels"
 	customopts "github.com/containerd/containerd/v2/internal/cri/opts"
+	"github.com/containerd/containerd/v2/internal/cri/server/restore"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	"github.com/containerd/containerd/v2/internal/cri/store/sandbox"
 	"github.com/containerd/containerd/v2/internal/cri/util"
@@ -49,6 +50,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/blockio"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/errdefs"
 )
 
 func init() {
@@ -147,8 +149,15 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	}
 
 	if checkpointImage {
-		// This might be a checkpoint image. Let's pass
-		// it to the checkpoint code.
+		// Restore is an explicit, operator-gated operation: checkpoint content
+		// is untrusted tenant input, so it must never be reachable implicitly
+		// through a regular CreateContainer (fail closed).
+		if !c.config.EnableCheckpointRestore {
+			return nil, fmt.Errorf(
+				"%q is a checkpoint image, but checkpoint restore is disabled; set enable_checkpoint_restore = true in the CRI runtime config to opt in",
+				config.GetImage().GetImage(),
+			)
+		}
 
 		if sandboxConfig.GetMetadata() == nil {
 			return nil, fmt.Errorf("sandboxConfig must not be empty")
@@ -228,7 +237,25 @@ type createContainerRequest struct {
 	containerdImage       *containerd.Image
 	meta                  *containerstore.Metadata
 	restore               bool
-	start                 time.Time
+	// restorer and checkpoint are set (with restore) when this create is a
+	// checkpoint restore; restorer re-binds resources into the spec through
+	// normal allocation paths instead of replaying checkpoint state.
+	restorer   *restore.Restorer
+	checkpoint *restore.Checkpoint
+	start      time.Time
+}
+
+// rebindSpecMutator is the [restore.SpecMutator] adapter over the OCI spec under
+// construction. Device re-binding requires a resource allocator (device-plugin /
+// DRA) that containerd does not own, so the built-in adapter fails closed; a
+// rebinder that needs it supplies its own mutation through a richer adapter when
+// that integration lands.
+type rebindSpecMutator struct {
+	spec *runtimespec.Spec
+}
+
+func (m *rebindSpecMutator) RebindDevice(_ context.Context, claim string) error {
+	return fmt.Errorf("rebinding device claim %q: %w", claim, errdefs.ErrNotImplemented)
 }
 
 func (c *criService) createContainer(r *createContainerRequest) (_ string, retErr error) {
@@ -324,6 +351,16 @@ func (c *criService) createContainer(r *createContainerRequest) (_ string, retEr
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate container %q spec: %w", r.containerID, err)
+	}
+
+	if r.restore && r.restorer != nil {
+		// Restore rebind phase: re-acquire devices/network/identity through the
+		// normal allocation path rather than replaying checkpoint-recorded
+		// state. With no rebinders registered this is a no-op; a failing
+		// rebinder aborts the restore (fail closed).
+		if err := r.restorer.RebindSpec(r.ctx, r.checkpoint, &rebindSpecMutator{spec: spec}); err != nil {
+			return "", fmt.Errorf("failed to rebind resources for restored container %q: %w", r.containerID, err)
+		}
 	}
 
 	r.meta.ProcessLabel = spec.Process.SelinuxLabel

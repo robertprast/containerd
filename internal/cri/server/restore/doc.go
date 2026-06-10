@@ -64,9 +64,11 @@
 // snapshot"). The unifying property is the same as the security fix:
 // re-allocate and rebind instead of replay.
 //
-// This package is an RFC skeleton: the trust boundary ([SanitizeAnnotations]) is
-// implemented and tested; the extension points ([Validator], [Rebinder]) and the
-// pipeline ([Restorer]) are defined with no-op defaults. Wiring into
-// CRImportCheckpoint is intentionally left to a follow-up so this change is
-// additive and reviewable on its own.
+// Phase 1 is implemented and wired: CreateContainer gates restore behind the
+// enable_checkpoint_restore config option (off by default, fail closed),
+// CRImportCheckpoint runs [Restorer.Prepare] (with [NewMetadataValidator] and
+// RequireVerified) before any persistent host-side effect, and createContainer
+// invokes [Restorer.RebindSpec] after the OCI spec is built. [Validator] and
+// [Rebinder] remain the extension points for signature/provenance verification
+// and DRA/device-plugin re-binding.
 package restore
