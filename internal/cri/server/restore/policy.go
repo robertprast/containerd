@@ -53,10 +53,26 @@ type AnnotationPolicy struct {
 // so this allowlist closes the smuggling class while staying behavior-preserving
 // for the kubelet's metadata.
 //
-// Open item for wiring (integration test): io.kubernetes.cri.* is the one
-// sub-namespace to scrutinize -- confirm none of those keys reach a host sink
-// before trusting this breadth in production. A stricter deployment can narrow
-// Allow to an explicit key list.
+// KNOWN COMPATIBILITY RISK (settle via integration test before relying on this):
+// some legitimate, operator-facing features key off annotations that are NOT
+// under io.kubernetes.* and are therefore dropped from the checkpoint:
+//
+//	blockio.resources.beta.kubernetes.io/*   (blockIO QoS class)
+//	rdt.resources.beta.kubernetes.io/*       (RDT QoS class)
+//	operator-configured ContainerAnnotations passthrough (arbitrary keys)
+//
+// This is only a regression if, on restore, the kubelet does NOT re-supply these
+// on the (trusted) create request -- in which case the value would have to come
+// from the checkpoint, and we now drop it. If the kubelet re-supplies them (the
+// expected behavior, since restore is a fresh create reflecting current desired
+// state) there is no regression and dropping the stale checkpoint copy is correct.
+// Containerd source cannot determine the kubelet's behavior; an integration test
+// must. If it turns out the kubelet does not re-supply blockIO/RDT, add those two
+// prefixes here -- they are bounded class-selection sinks (the kubelet is trusted)
+// and far lower risk than the device/hook sinks this allowlist exists to block.
+//
+// io.kubernetes.cri.* is preserved by the prefix match and is also re-created
+// during spec build (DefaultCRIAnnotations), so it does not regress.
 func DefaultAnnotationPolicy() AnnotationPolicy {
 	return AnnotationPolicy{
 		Allow: []string{
@@ -68,15 +84,16 @@ func DefaultAnnotationPolicy() AnnotationPolicy {
 // allows reports whether key is permitted by the policy.
 func (p AnnotationPolicy) allows(key string) bool {
 	for _, pat := range p.Allow {
-		if pat == "" {
+		// Ignore "match everything" / empty entries entirely (including via the
+		// exact-match branch): an allowlist must name what it permits, so a stray
+		// "*" or "" can never allow a key -- not even the literal key "*".
+		if pat == "" || pat == "*" {
 			continue
 		}
 		if pat == key {
 			return true
 		}
-		// Prefix entries end in "*". A bare "*" (empty prefix) is intentionally
-		// ignored so that a stray or mistaken entry cannot silently allow
-		// everything -- an allowlist must name what it permits.
+		// Prefix entries end in "*".
 		if pfx, ok := strings.CutSuffix(pat, "*"); ok && pfx != "" && strings.HasPrefix(key, pfx) {
 			return true
 		}

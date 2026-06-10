@@ -111,6 +111,37 @@ replay* — is the same primitive that unlocks:
 One Restore API, three payoffs: it closes the security class, and the mechanism
 that closes it is what makes warm-starts safe and live-migration correct.
 
+## Compatibility blast radius (this is a behavior change)
+
+Wiring `SanitizeAnnotations` into restore changes behavior: checkpoint annotations
+outside `io.kubernetes.*` are now dropped. A source analysis of every annotation
+consumer in the restore path classifies the impact:
+
+| Annotation class | Source on restore | Verdict |
+|---|---|---|
+| `io.kubernetes.cri.*` | re-created in spec build (`DefaultCRIAnnotations`) + allowlisted | **safe** — no regression |
+| `io.kubernetes.container.*`, `io.kubernetes.pod.*` | kubelet create request + allowlisted | **safe** |
+| `restored` / `checkpointedAt` / `checkpointImage` | added by containerd *after* sanitize | **safe** |
+| `cdi.k8s.io/*` (legit) | kubelet via create request or `CDIDevices` field | **safe if** kubelet re-supplies (likely; `CDIDevices` compensates) |
+| `cdi.k8s.io/*`, `devices.nri.io/*`, `containerd.io/restart.*` (smuggled) | checkpoint only | **dropped — security win** |
+| **`blockio.resources.beta.kubernetes.io/*`** | kubelet create request **or** checkpoint | **REGRESSION RISK** — dropped; QoS class lost if kubelet doesn't re-supply on restore |
+| **`rdt.resources.beta.kubernetes.io/*`** | same | **REGRESSION RISK** — same |
+| **operator `ContainerAnnotations` passthrough** (arbitrary keys) | kubelet create request | **REGRESSION RISK** — dropped if non-`io.kubernetes.*` and not re-supplied |
+
+The three regression risks all reduce to **one unknown**: *does the kubelet
+re-supply these on the restore create request?* Restore is a fresh `CreateContainer`
+from the kubelet reflecting current desired state, so it *should* — but containerd
+source can't prove it. The integration test below settles it; if the kubelet does
+not re-supply blockIO/RDT, add those two (bounded, kubelet-trusted) prefixes to the
+allowlist.
+
+### Integration test checklist (run in a real kubelet+containerd node)
+- [ ] checkpoint a container with `blockio.resources.beta.kubernetes.io/container.X`; restore; assert the blockIO class is applied (i.e. kubelet re-supplied it, or add the prefix).
+- [ ] same for `rdt.resources.beta.kubernetes.io/container.X`.
+- [ ] CDI: restore a container whose checkpoint requested a device; assert it is **not** injected unless the current request asked via `CDIDevices` / `cdi.k8s.io/*`.
+- [ ] operator `container_annotations = ["custom.io/*"]`: checkpoint+restore; assert `custom.io/*` round-trips or document the limitation.
+- [ ] smuggle: checkpoint with `cdi.k8s.io/`, `devices.nri.io/`, `containerd.io/restart.loguri`; assert all dropped (unit-covered; confirm end-to-end).
+
 ## Scope of this PR
 
 - New `internal/cri/server/restore` package (+ tests), and the **annotation
