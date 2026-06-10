@@ -38,35 +38,60 @@ validate  ->  sanitize  ->  rebind  ->  (CRIU restore, performed by caller)
   allocation path** (device-plugin / DRA / CNI / fresh SA token) instead of
   replaying checkpoint-recorded state.
 
-Implemented + unit-tested here: the annotation trust boundary. Defined with no-op
-defaults: the `Validator` / `Rebinder` extension points and the `Restorer`
-pipeline. Wiring into `CRImportCheckpoint` is intentionally deferred so this is
-reviewable on its own.
+Implemented, unit-tested, **and wired**: the annotation trust boundary — the
+manual `hash`/`restartCount` fixup in `CRImportCheckpoint` is replaced by
+`restore.SanitizeAnnotations` with the `io.kubernetes.*` allowlist (every known
+runtime-affecting sink — `cdi.k8s.io/`, `devices.nri.io/`, `containerd.io/`,
+blockIO/RDT — lives outside that namespace, so it is dropped). Defined with no-op
+defaults and **not** yet wired: the `Validator` / `Rebinder` extension points.
+
+> Verification note: the `restore` package compiles and its tests pass (run in a
+> standalone module). The one-line wiring edit in `CRImportCheckpoint` is
+> syntax-checked but **not** build-verified in the authoring environment (its CRI
+> package needs a newer Go toolchain than was available); confirm with
+> `go build ./internal/cri/...` and the checkpoint integration test before trust.
+
+**Deferred to phase 2, on purpose (real refactors, not blind edits):**
+
+- **validate placement** — `CRImportCheckpoint` already unpacks the checkpoint to
+  a temp mount before annotations are handled, so a "verify before unpack" posture
+  means moving the gate earlier than the current annotation site.
+- **rebind into spec** — the OCI spec is built *inside* `createContainer` →
+  `buildContainerSpec`, after annotations are settled, so `RebindSpec` needs a
+  `SpecMutator` threaded through the spec-build pipeline (a signature change).
 
 **Phase 2 (follow-up, public).** Promote to a dedicated CRI/runtime Restore RPC so
 the orchestrator declares intent + policy (preserve vs rebind network identity,
 device re-allocation strategy, trust posture) rather than it leaking in via the
 create path.
 
-## Intended call site (sketch, not in this PR)
+## Wired call site (annotations) + the deferred phases
+
+What this PR wires into `CRImportCheckpoint` today, replacing the manual fixup:
 
 ```go
-// in CRImportCheckpoint, replacing the wholesale meta.Config.Annotations = ...
+// originalAnnotations = containerStatus.GetAnnotations()  (UNTRUSTED)
+sanitized, dropped := restore.SanitizeAnnotations(
+    originalAnnotations, createAnnotations, restore.DefaultAnnotationPolicy())
+for _, k := range dropped {
+    log.G(ctx).Warnf("restore: dropping untrusted checkpoint annotation %q", k)
+}
+originalAnnotations = sanitized          // fail-closed; feeds meta.Config.Annotations
+```
+
+The full two-call-site shape the extension points are designed for (phase 2):
+
+```go
 r := restore.New(c.restorePolicy,
-    restore.WithValidator(c.checkpointVerifier),   // phase-1 trust gate
+    restore.WithValidator(c.checkpointVerifier),   // gate before unpack (needs the gate moved earlier)
     restore.WithRebinder(c.deviceRebinder),        // re-allocate, don't replay
 )
-res, err := r.Prepare(ctx, &restore.Checkpoint{
-    ImageRef:    inputImage,
-    Annotations: containerStatus.GetAnnotations(), // UNTRUSTED
-}, createAnnotations, specMutator)
-if err != nil {
-    return "", err
-}
-meta.Config.Annotations = res.Annotations          // sanitized, fail-closed
-for _, k := range res.DroppedAnnotations {
-    log.G(ctx).Warnf("restore: dropped untrusted checkpoint annotation %q", k)
-}
+// pre-create:
+res, err := r.Prepare(ctx, &restore.Checkpoint{ImageRef: inputImage, Annotations: originalAnnotations}, createAnnotations)
+...
+originalAnnotations = res.Annotations
+// later, during buildContainerSpec (needs a SpecMutator threaded through):
+err = r.RebindSpec(ctx, cp, specMutator)
 ```
 
 ## Why this is worth doing properly (beyond the CVE)
@@ -88,7 +113,15 @@ that closes it is what makes warm-starts safe and live-migration correct.
 
 ## Scope of this PR
 
-- New package + tests only. No behavior change to the existing restore path.
-- Not wired in; not a CRI API change yet. Looking for agreement on the shape
-  (pipeline + fail-closed allowlist + validate/rebind extension points) before the
-  wiring and the public RPC work.
+- New `internal/cri/server/restore` package (+ tests), and the **annotation
+  sanitization wired** into `CRImportCheckpoint` (replaces the manual
+  hash/restartCount fixup). This is a behavior change on the restore path:
+  non-`io.kubernetes.*` checkpoint annotations are now dropped.
+- **Not** a CRI API change. `Validator` / `Rebinder` are defined but not wired
+  (their phases need the refactors noted above).
+- Verification: the package builds + tests pass; the CRImportCheckpoint edit is
+  syntax-checked but not build-verified in the authoring env — needs
+  `go build ./internal/cri/...` and the checkpoint integration test.
+- Looking for agreement on the shape (fail-closed allowlist + the
+  validate/rebind extension points) and on the allowlist breadth
+  (`io.kubernetes.*` vs an explicit key list) before the public RPC work.

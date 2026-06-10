@@ -51,7 +51,10 @@ type SpecMutator interface {
 // place for checkpoint signature / provenance / host-compatibility checks, and
 // is pluggable in the same spirit as image verifiers.
 type Validator interface {
+	// Name identifies the validator in error messages.
 	Name() string
+	// Validate inspects the checkpoint and returns a non-nil error to abort the
+	// restore before any host-side effect. Implementations must not mutate c.
 	Validate(ctx context.Context, c *Checkpoint) error
 }
 
@@ -61,7 +64,10 @@ type Validator interface {
 // correct behavior for migration/warm-start and the security boundary that stops
 // a checkpoint from smuggling host resources.
 type Rebinder interface {
+	// Name identifies the rebinder in error messages.
 	Name() string
+	// Rebind re-acquires a resource and applies it to the spec under
+	// construction via m, which is guaranteed non-nil by RebindSpec.
 	Rebind(ctx context.Context, c *Checkpoint, m SpecMutator) error
 }
 
@@ -81,10 +87,12 @@ func DefaultPolicy() Policy {
 	return Policy{Annotations: DefaultAnnotationPolicy()}
 }
 
-// Restorer runs the restore pipeline. The actual CRIU restore is performed by
-// the caller (CRImportCheckpoint) AFTER Prepare succeeds; Restorer owns only the
-// trust + transform phases so they are testable in isolation and cannot be
-// bypassed by a future code path that forgets to sanitize.
+// Restorer owns the trust + transform phases of a restore, exposed at the two
+// points in the flow where they actually apply: [Restorer.Prepare] (validate +
+// annotation sanitize, before the container is built) and [Restorer.RebindSpec]
+// (device/network/identity re-bind, during spec construction). The CRIU restore
+// itself is performed by the caller (CRImportCheckpoint). Keeping these phases
+// here makes them testable in isolation and hard to bypass.
 type Restorer struct {
 	policy     Policy
 	validators []Validator
@@ -124,15 +132,22 @@ type Result struct {
 	DroppedAnnotations []string
 }
 
-// Prepare runs validate -> sanitize -> rebind and returns the sanitized
-// annotation set for the restored container. It performs no CRIU restore and no
-// container creation; the caller does that only if Prepare returns no error.
-func (r *Restorer) Prepare(ctx context.Context, c *Checkpoint, createAnnotations map[string]string, m SpecMutator) (*Result, error) {
+// Prepare runs the pre-create phases -- validate then sanitize -- and returns
+// the sanitized annotation set for the restored container. It performs no CRIU
+// restore and no container creation; the caller proceeds only if Prepare returns
+// no error.
+//
+// Re-binding is deliberately NOT part of Prepare: the OCI spec does not exist at
+// this point in the restore flow (annotations are settled before the container /
+// spec is built). Device/network/identity re-binding happens later, during spec
+// construction, via [Restorer.RebindSpec] -- two real call sites, not one.
+func (r *Restorer) Prepare(ctx context.Context, c *Checkpoint, createAnnotations map[string]string) (*Result, error) {
 	if c == nil {
 		return nil, errors.New("restore: nil checkpoint")
 	}
 
-	// Phase 1 -- trust gate (before any host-side effect).
+	// Phase 1 -- trust gate. Should run before the restore commits persistent
+	// host-side effects (image pull, tag write).
 	verified := false
 	for _, v := range r.validators {
 		if err := v.Validate(ctx, c); err != nil {
@@ -147,12 +162,25 @@ func (r *Restorer) Prepare(ctx context.Context, c *Checkpoint, createAnnotations
 	// Phase 2 -- annotation trust boundary (fail-closed allowlist).
 	anns, dropped := SanitizeAnnotations(c.Annotations, createAnnotations, r.policy.Annotations)
 
-	// Phase 3 -- re-acquire resources through normal allocation paths.
+	return &Result{Annotations: anns, DroppedAnnotations: dropped}, nil
+}
+
+// RebindSpec runs the registered rebinders against the OCI spec under
+// construction, re-acquiring devices/network/identity through normal allocation
+// paths instead of replaying checkpoint-recorded state. It is invoked during
+// spec build -- a separate, later point in the restore flow than [Restorer.Prepare].
+// m must be non-nil.
+func (r *Restorer) RebindSpec(ctx context.Context, c *Checkpoint, m SpecMutator) error {
+	if c == nil {
+		return errors.New("restore: nil checkpoint")
+	}
+	if m == nil && len(r.rebinders) > 0 {
+		return errors.New("restore: RebindSpec requires a non-nil SpecMutator")
+	}
 	for _, rb := range r.rebinders {
 		if err := rb.Rebind(ctx, c, m); err != nil {
-			return nil, fmt.Errorf("restore: rebinder %q failed: %w", rb.Name(), err)
+			return fmt.Errorf("restore: rebinder %q failed: %w", rb.Name(), err)
 		}
 	}
-
-	return &Result{Annotations: anns, DroppedAnnotations: dropped}, nil
+	return nil
 }

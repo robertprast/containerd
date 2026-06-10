@@ -16,7 +16,10 @@
 
 package restore
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // AnnotationPolicy controls which checkpoint-origin annotations are allowed to
 // survive onto a restored container.
@@ -35,23 +38,29 @@ type AnnotationPolicy struct {
 	Allow []string
 }
 
-// DefaultAnnotationPolicy restores only the small set of Kubernetes bookkeeping
-// annotations that the kubelet expects to round-trip through a restore, so it
-// does not see the container as needing a restart. Everything else from the
-// checkpoint (cdi.k8s.io/*, devices.nri.io/*, containerd.io/*, operator/tenant
-// keys, ...) is dropped.
+// DefaultAnnotationPolicy restores the kubelet's own annotation namespace
+// (io.kubernetes.*) -- the bookkeeping/metadata the kubelet expects to round-trip
+// through a restore so it does not see the container as needing a restart -- and
+// drops everything else from the checkpoint. Crucially, every known
+// runtime-affecting annotation sink lives OUTSIDE io.kubernetes.*:
 //
-// Keep this list intentionally tiny and explicit. Adding an entry is a
-// deliberate decision that the key is display/bookkeeping only and never reaches
-// a host-affecting sink.
+//	cdi.k8s.io/*                            (CDI device injection)
+//	devices.nri.io/*, mounts.nri.io/*       (NRI device/hook injector plugins)
+//	containerd.io/*                          (restart-monitor log URI, gc refs)
+//	blockio.resources.beta.kubernetes.io/*   (blockIO class)
+//	rdt.resources.beta.kubernetes.io/*       (RDT class)
+//
+// so this allowlist closes the smuggling class while staying behavior-preserving
+// for the kubelet's metadata.
+//
+// Open item for wiring (integration test): io.kubernetes.cri.* is the one
+// sub-namespace to scrutinize -- confirm none of those keys reach a host sink
+// before trusting this breadth in production. A stricter deployment can narrow
+// Allow to an explicit key list.
 func DefaultAnnotationPolicy() AnnotationPolicy {
 	return AnnotationPolicy{
 		Allow: []string{
-			"io.kubernetes.container.hash",
-			"io.kubernetes.container.restartCount",
-			"io.kubernetes.container.terminationMessagePath",
-			"io.kubernetes.container.preStopHandler",
-			"io.kubernetes.container.ports",
+			"io.kubernetes.*",
 		},
 	}
 }
@@ -59,10 +68,16 @@ func DefaultAnnotationPolicy() AnnotationPolicy {
 // allows reports whether key is permitted by the policy.
 func (p AnnotationPolicy) allows(key string) bool {
 	for _, pat := range p.Allow {
+		if pat == "" {
+			continue
+		}
 		if pat == key {
 			return true
 		}
-		if pfx, ok := strings.CutSuffix(pat, "*"); ok && strings.HasPrefix(key, pfx) {
+		// Prefix entries end in "*". A bare "*" (empty prefix) is intentionally
+		// ignored so that a stray or mistaken entry cannot silently allow
+		// everything -- an allowlist must name what it permits.
+		if pfx, ok := strings.CutSuffix(pat, "*"); ok && pfx != "" && strings.HasPrefix(key, pfx) {
 			return true
 		}
 	}
@@ -86,13 +101,23 @@ func SanitizeAnnotations(checkpoint, createRequest map[string]string, p Annotati
 		result[k] = v
 	}
 	for k, v := range checkpoint {
-		if p.allows(k) {
-			result[k] = v
+		if !p.allows(k) {
+			// Not on the allowlist: drop it (and record for audit).
+			dropped = append(dropped, k)
 			continue
 		}
-		// Do not override a trusted create-request value with an untrusted one,
-		// and do not introduce an untrusted key. Record it as dropped.
-		dropped = append(dropped, k)
+		if _, exists := result[k]; exists {
+			// Create-request annotations are authoritative; an allowlisted
+			// checkpoint key only fills a gap the create request did not set.
+			// This keeps e.g. io.kubernetes.container.hash / restartCount at the
+			// kubelet's current value (so the restore is not seen as a restart)
+			// rather than the checkpoint's stale one -- never override trusted
+			// with untrusted, even for allowlisted keys.
+			continue
+		}
+		result[k] = v
 	}
+	// Stable order for audit logs (map iteration is randomized).
+	slices.Sort(dropped)
 	return result, dropped
 }

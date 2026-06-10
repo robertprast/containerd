@@ -32,20 +32,30 @@
 // # Design (two phase)
 //
 // Phase 1 (this skeleton): draw the trust boundary explicitly. Checkpoint content
-// is UNTRUSTED by default. A restore is a pipeline with three stages:
+// is UNTRUSTED by default. A restore applies these stages, at the TWO points in
+// the flow where they actually fit (not one call):
 //
-//		validate  -> sanitize -> rebind -> (CRIU restore, performed by the caller)
+//	[Restorer.Prepare]   (pre-create):  validate -> sanitize
+//	[Restorer.RebindSpec] (spec build): rebind
+//	(then the caller performs the CRIU restore)
 //
-//	  - validate: gate the checkpoint before ANY host-side effect (signature /
-//	    provenance / compatibility). Pluggable, like image verifiers.
+//	  - validate: gate the checkpoint (signature / provenance / compatibility)
+//	    before the restore commits persistent host-side effects (image pull, tag
+//	    write). Pluggable, like image verifiers. Note: today's CRImportCheckpoint
+//	    already unpacks the checkpoint to a temp mount before this point, so a
+//	    stricter "verify before unpack" posture means moving the gate earlier --
+//	    called out in the RFC, not assumed here.
 //	  - sanitize: install only an explicit allowlist of checkpoint-origin
-//	    annotations onto the restored container; everything else is dropped
-//	    fail-closed (see [SanitizeAnnotations]). This subsumes the per-prefix
-//	    denylist: a forgotten future sink fails CLOSED (restore drops the key)
-//	    instead of OPEN (silent re-trust).
-//	  - rebind: re-acquire devices / network / identity through the NORMAL
-//	    allocation path (device-plugin / DRA / CNI / fresh SA token) instead of
-//	    replaying checkpoint-recorded state (see [Rebinder]).
+//	    annotations onto the restored container; create-request values are
+//	    authoritative and everything not allowlisted is dropped fail-closed (see
+//	    [SanitizeAnnotations]). This subsumes the per-prefix denylist: a forgotten
+//	    future sink fails CLOSED (restore drops the key) instead of OPEN (silent
+//	    re-trust).
+//	  - rebind: during spec construction, re-acquire devices / network / identity
+//	    through the NORMAL allocation path (device-plugin / DRA / CNI / fresh SA
+//	    token) instead of replaying checkpoint-recorded state (see [Rebinder]).
+//	    The OCI spec does not exist at Prepare time, which is why this is a
+//	    separate call.
 //
 // Phase 2 (follow-up, public): promote this to a dedicated CRI/runtime Restore
 // RPC so the orchestrator can declare intent and policy (preserve vs rebind

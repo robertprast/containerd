@@ -40,6 +40,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	crilabels "github.com/containerd/containerd/v2/internal/cri/labels"
+	"github.com/containerd/containerd/v2/internal/cri/server/restore"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	"github.com/containerd/containerd/v2/internal/cri/store/sandbox"
@@ -293,23 +294,19 @@ func (c *criService) CRImportCheckpoint(
 		}
 	}
 
-	if createAnnotations != nil {
-		// The hash also needs to be update or Kubernetes thinks the container needs to be restarted
-		_, ok1 := createAnnotations["io.kubernetes.container.hash"]
-		_, ok2 := originalAnnotations["io.kubernetes.container.hash"]
-
-		if ok1 && ok2 {
-			originalAnnotations["io.kubernetes.container.hash"] = createAnnotations["io.kubernetes.container.hash"]
-		}
-
-		// The restart count also needs to be correctly updated
-		_, ok1 = createAnnotations["io.kubernetes.container.restartCount"]
-		_, ok2 = originalAnnotations["io.kubernetes.container.restartCount"]
-
-		if ok1 && ok2 {
-			originalAnnotations["io.kubernetes.container.restartCount"] = createAnnotations["io.kubernetes.container.restartCount"]
-		}
+	// Checkpoint-origin annotations are UNTRUSTED. Sanitize them against the
+	// restore allowlist: create-request annotations are authoritative, and only
+	// the kubelet's own (io.kubernetes.*) bookkeeping keys are restored from the
+	// checkpoint -- which subsumes the old manual hash/restartCount fixup. This
+	// drops smuggled runtime-affecting annotations (cdi.k8s.io/, devices.nri.io/,
+	// containerd.io/restart.*, blockio/rdt classes, ...) at a single chokepoint,
+	// protecting every downstream consumer (CDI, NRI, blockIO/RDT, restart monitor)
+	// instead of each sink defending itself. See internal/cri/server/restore.
+	sanitized, dropped := restore.SanitizeAnnotations(originalAnnotations, createAnnotations, restore.DefaultAnnotationPolicy())
+	for _, k := range dropped {
+		log.G(ctx).Warnf("restore: dropping untrusted checkpoint annotation %q", k)
 	}
+	originalAnnotations = sanitized
 
 	var containerdImage client.Image
 
