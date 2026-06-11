@@ -435,6 +435,14 @@ type RuntimeConfig struct {
 	// that should be ignored for checking "ContainerdHasNoDeprecationWarnings" condition.
 	IgnoreDeprecationWarnings []string `toml:"ignore_deprecation_warnings" json:"ignoreDeprecationWarnings"`
 
+	// EnableCheckpointRestore enables restoring containers from checkpoint
+	// archives/images via CreateContainer. Checkpoint content is untrusted
+	// tenant input: a restore re-creates a container from metadata authored by
+	// whoever built the checkpoint, so this path is disabled unless an operator
+	// explicitly opts in. Checkpointing (CheckpointContainer) is unaffected.
+	// Default: false.
+	EnableCheckpointRestore bool `toml:"enable_checkpoint_restore" json:"enableCheckpointRestore"`
+
 	// StatsCollectPeriod is the period for collecting container/sandbox CPU stats
 	// used for calculating UsageNanoCores. This matches cAdvisor's default housekeeping interval.
 	// The string is in the golang duration format, see:

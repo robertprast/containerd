@@ -268,6 +268,7 @@ version = 3
     netns_mounts_under_state_dir = false
     enable_unprivileged_ports = true
     enable_unprivileged_icmp = true
+    enable_checkpoint_restore = false
     enable_cdi = true
     cdi_spec_dirs = ['/etc/cdi', '/var/run/cdi']
     drain_exec_sync_io_timeout = '0s'
@@ -446,6 +447,13 @@ version = 2
   # and if it is not overwritten by PodSandboxConfig
   # Note that before containerd v2.0, this value defaulted to false.
   enable_unprivileged_icmp = true
+
+  # enable_checkpoint_restore enables restoring containers from checkpoint
+  # archives/images via CreateContainer. Checkpoint content is untrusted
+  # tenant input (the checkpoint author controls the metadata a restore is
+  # built from), so this path is disabled unless an operator explicitly opts
+  # in. Checkpointing containers (CheckpointContainer) is unaffected.
+  enable_checkpoint_restore = false
 
   # enable_cdi enables support of the Container Device Interface (CDI)
   # For more details about CDI and the syntax of CDI Spec files please refer to
