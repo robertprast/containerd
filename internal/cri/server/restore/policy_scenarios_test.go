@@ -44,14 +44,14 @@ var realKubeletContainerAnnotations = map[string]string{
 	"io.kubernetes.cri.image-name":                     "nginx:1.27",
 }
 
-// smuggleable is the set of runtime-affecting annotation sinks that a checkpoint
-// could carry; ALL must be dropped when sourced from the checkpoint.
-var smuggleable = map[string]string{
+// runtimeSinkAnnotations is the set of runtime-affecting annotation sinks that a
+// checkpoint could carry; ALL must be dropped when sourced from the checkpoint.
+var runtimeSinkAnnotations = map[string]string{
 	"cdi.k8s.io/gpu":                           "nvidia.com/gpu=0",
 	"cdi.k8s.io":                               "x",
 	"devices.nri.io/container.app":             "/dev/mem",
 	"mounts.nri.io/container.app":              "/:/host",
-	"containerd.io/restart.loguri":             "binary:///bin/sh",
+	"containerd.io/restart.loguri":             "binary:///bin/true",
 	"containerd.io/restart.status":             "running",
 	"containerd.io/gc.ref.content.x":           "sha256:dead",
 	"blockio.resources.beta.kubernetes.io/pod": "highio",
@@ -65,13 +65,13 @@ var smuggleable = map[string]string{
 
 // TestRealKubeletCorpusRoundTrips: a real checkpointed container's kubelet
 // annotations survive a restore unchanged when the create request did not also
-// carry them (checkpoint fills the gaps), and smuggled keys are dropped.
+// carry them (checkpoint fills the gaps), and out-of-namespace keys are dropped.
 func TestRealKubeletCorpusRoundTrips(t *testing.T) {
 	checkpoint := map[string]string{}
 	for k, v := range realKubeletContainerAnnotations {
 		checkpoint[k] = v
 	}
-	for k, v := range smuggleable {
+	for k, v := range runtimeSinkAnnotations {
 		checkpoint[k] = v
 	}
 
@@ -82,29 +82,29 @@ func TestRealKubeletCorpusRoundTrips(t *testing.T) {
 			t.Errorf("legit kubelet annotation %q not preserved on restore: got %q want %q", k, got[k], want)
 		}
 	}
-	for k := range smuggleable {
+	for k := range runtimeSinkAnnotations {
 		if k == "" {
 			continue // empty key can't be set in a real map anyway
 		}
 		if _, ok := got[k]; ok {
-			t.Errorf("smuggleable annotation %q survived restore", k)
+			t.Errorf("runtime-sink annotation %q survived restore", k)
 		}
 		if !slices.Contains(dropped, k) {
-			t.Errorf("smuggleable annotation %q not reported as dropped", k)
+			t.Errorf("runtime-sink annotation %q not reported as dropped", k)
 		}
 	}
 }
 
 // TestLegitRequestCDISurvivesCheckpointCDIDropped is the crux of correctness:
 // a device legitimately requested by the CURRENT (kubelet) create request must
-// survive, while a device smuggled in the checkpoint must be dropped. They can
+// survive, while a device carried by the checkpoint must be dropped. They can
 // even share the cdi.k8s.io/ prefix.
 func TestLegitRequestCDISurvivesCheckpointCDIDropped(t *testing.T) {
 	create := map[string]string{
 		"cdi.k8s.io/net": "vendor.com/net=eth0", // operator/kubelet asked for this NOW
 	}
 	checkpoint := map[string]string{
-		"cdi.k8s.io/gpu": "evil.com/gpu=all", // smuggled by the checkpoint
+		"cdi.k8s.io/gpu": "example.com/gpu=all", // carried by the checkpoint
 	}
 	got, dropped := SanitizeAnnotations(checkpoint, create, DefaultAnnotationPolicy())
 
@@ -112,10 +112,10 @@ func TestLegitRequestCDISurvivesCheckpointCDIDropped(t *testing.T) {
 		t.Errorf("legit create-request CDI device was lost: %v", got)
 	}
 	if _, ok := got["cdi.k8s.io/gpu"]; ok {
-		t.Error("smuggled checkpoint CDI device survived")
+		t.Error("checkpoint-origin CDI device survived")
 	}
 	if !slices.Contains(dropped, "cdi.k8s.io/gpu") {
-		t.Error("smuggled CDI not reported dropped")
+		t.Error("checkpoint-origin CDI not reported dropped")
 	}
 }
 
@@ -124,7 +124,7 @@ func TestLegitRequestCDISurvivesCheckpointCDIDropped(t *testing.T) {
 // reported as dropped (its value did not win).
 func TestConflictBothUnallowlisted(t *testing.T) {
 	create := map[string]string{"cdi.k8s.io/x": "trusted"}
-	checkpoint := map[string]string{"cdi.k8s.io/x": "attacker"}
+	checkpoint := map[string]string{"cdi.k8s.io/x": "from-checkpoint"}
 	got, dropped := SanitizeAnnotations(checkpoint, create, DefaultAnnotationPolicy())
 	if got["cdi.k8s.io/x"] != "trusted" {
 		t.Errorf("trusted create value must win, got %q", got["cdi.k8s.io/x"])
@@ -141,7 +141,7 @@ func TestIdempotent(t *testing.T) {
 	for k, v := range realKubeletContainerAnnotations {
 		checkpoint[k] = v
 	}
-	for k, v := range smuggleable {
+	for k, v := range runtimeSinkAnnotations {
 		if k != "" {
 			checkpoint[k] = v
 		}
@@ -231,7 +231,7 @@ func TestSanitizeInvariants(t *testing.T) {
 		checkpoint := pick("ckpt")
 		got, dropped := SanitizeAnnotations(checkpoint, create, pol)
 
-		// INV1 -- no smuggle: every result key is from create, or an allowlisted checkpoint key.
+		// INV1 -- no re-trust: every result key is from create, or an allowlisted checkpoint key.
 		for k := range got {
 			_, inCreate := create[k]
 			_, inCkpt := checkpoint[k]
@@ -262,11 +262,12 @@ func TestSanitizeInvariants(t *testing.T) {
 	}
 }
 
-// FuzzSanitizeNoSmuggle fuzzes the sanitizer and asserts the no-smuggle invariant
-// and no panic for arbitrary keys/values.
-func FuzzSanitizeNoSmuggle(f *testing.F) {
+// FuzzSanitizeAllowlist fuzzes the sanitizer and asserts the allowlist invariant
+// (every surviving key is from create or an allowlisted checkpoint key) and no
+// panic for arbitrary keys/values.
+func FuzzSanitizeAllowlist(f *testing.F) {
 	f.Add("cdi.k8s.io/gpu", "v1", "io.kubernetes.container.hash", "v2")
-	f.Add("io.kubernetes.*", "v", "containerd.io/restart.loguri", "rce")
+	f.Add("io.kubernetes.*", "v", "containerd.io/restart.loguri", "binary:///bin/true")
 	pol := DefaultAnnotationPolicy()
 	f.Fuzz(func(t *testing.T, ck, cv, rk, rv string) {
 		checkpoint := map[string]string{ck: cv}
@@ -276,7 +277,7 @@ func FuzzSanitizeNoSmuggle(f *testing.F) {
 			_, inCreate := create[k]
 			_, inCkpt := checkpoint[k]
 			if !inCreate && !(inCkpt && pol.allows(k)) {
-				t.Fatalf("no-smuggle violated for surviving key %q", k)
+				t.Fatalf("allowlist invariant violated for surviving key %q", k)
 			}
 		}
 	})

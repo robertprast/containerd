@@ -24,25 +24,25 @@ import (
 )
 
 func TestSanitizeAnnotationsFailClosed(t *testing.T) {
-	// status.dump annotations: a mix of smuggling attempts and two allowlisted
-	// bookkeeping keys (one also set by the create request, one not).
+	// status.dump annotations: a mix of checkpoint-origin runtime-sink keys and
+	// two allowlisted bookkeeping keys (one also set by the create request, one not).
 	checkpoint := map[string]string{
-		"cdi.k8s.io/gpu":                       "nvidia.com/gpu=0", // smuggled CDI device
-		"devices.nri.io/container.app":         "/dev/mem",         // smuggled NRI device-injector
-		"containerd.io/restart.loguri":         "binary:///bin/sh", // smuggled restart-monitor RCE
-		"user.tenant/whatever":                 "x",                // arbitrary tenant key
-		"io.kubernetes.container.hash":         "checkpoint-hash",  // allowlisted, ALSO in create
-		"io.kubernetes.container.restartCount": "2",                // allowlisted, only in checkpoint
+		"cdi.k8s.io/gpu":                       "nvidia.com/gpu=0",   // checkpoint-origin CDI device
+		"devices.nri.io/container.app":         "/dev/mem",           // checkpoint-origin NRI device-injector
+		"containerd.io/restart.loguri":         "binary:///bin/true", // checkpoint-origin restart-monitor log URI
+		"user.tenant/whatever":                 "x",                  // arbitrary tenant key
+		"io.kubernetes.container.hash":         "checkpoint-hash",    // allowlisted, ALSO in create
+		"io.kubernetes.container.restartCount": "2",                  // allowlisted, only in checkpoint
 	}
 	// Trusted, kubelet-issued create-request annotations.
 	create := map[string]string{
 		"io.kubernetes.container.hash": "create-hash",
-		"io.kubernetes.pod.name":       "victim",
+		"io.kubernetes.pod.name":       "real-pod",
 	}
 
 	got, dropped := SanitizeAnnotations(checkpoint, create, DefaultAnnotationPolicy())
 
-	// Every dangerous/unknown checkpoint key must be dropped.
+	// Every out-of-namespace/unknown checkpoint key must be dropped.
 	for _, k := range []string{
 		"cdi.k8s.io/gpu",
 		"devices.nri.io/container.app",
@@ -50,7 +50,7 @@ func TestSanitizeAnnotationsFailClosed(t *testing.T) {
 		"user.tenant/whatever",
 	} {
 		if _, ok := got[k]; ok {
-			t.Errorf("smuggled checkpoint annotation %q survived sanitization", k)
+			t.Errorf("checkpoint-origin annotation %q survived sanitization", k)
 		}
 		if !slices.Contains(dropped, k) {
 			t.Errorf("expected %q to be reported as dropped", k)
@@ -67,7 +67,7 @@ func TestSanitizeAnnotationsFailClosed(t *testing.T) {
 		t.Errorf("allowlisted restartCount should fill from checkpoint, got %q", got["io.kubernetes.container.restartCount"])
 	}
 	// Trusted create-request keys are preserved.
-	if got["io.kubernetes.pod.name"] != "victim" {
+	if got["io.kubernetes.pod.name"] != "real-pod" {
 		t.Errorf("create-request annotation lost: got %q", got["io.kubernetes.pod.name"])
 	}
 	// Dropped list is sorted for stable audit logs.
@@ -158,7 +158,7 @@ func TestRestorerPrepareSanitizes(t *testing.T) {
 		t.Fatalf("Prepare: %v", err)
 	}
 	if _, ok := res.Annotations["cdi.k8s.io/x"]; ok {
-		t.Error("pipeline did not sanitize the smuggled CDI annotation")
+		t.Error("pipeline did not sanitize the checkpoint-origin CDI annotation")
 	}
 	if res.Annotations["base"] != "1" {
 		t.Error("pipeline lost the create-request annotation")

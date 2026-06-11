@@ -6,16 +6,16 @@ Status: **Draft — phase 1 implemented and wired** — seeking direction on pha
 
 Restore is currently an implicit branch of `CreateContainer`: containerd detects a
 checkpoint-annotated image (`checkIfCheckpointOCIImage`) and `CRImportCheckpoint`
-re-emits a create request built from attacker-authored checkpoint metadata
+re-emits a create request built from checkpoint-authored metadata
 (`status.dump` / `config.dump`), feeding it back into the pipeline otherwise
 reserved for kubelet-validated input.
 
-That one decision turns untrusted archive bytes into trusted CRI inputs. It is the
-root cause behind the CDI annotation-smuggling advisory, and the *same* re-trust
-reaches other annotation-driven sinks — NRI plugins, snapshot id-map labels, the
-restart-monitor log URI, blockIO/RDT class selection. Each per-sink fix (e.g. a
-`cdi.k8s.io/` denylist) closes one instance and **fails open** the next time a
-feature adds an annotation-driven sink and nobody updates the list.
+That one decision turns untrusted archive bytes into trusted CRI inputs. The same
+re-trust reaches every annotation-driven sink — CDI device selection, NRI plugins,
+snapshot id-map labels, the restart-monitor log URI, blockIO/RDT class selection.
+Each per-sink fix (e.g. a `cdi.k8s.io/` denylist) closes one instance and **fails
+open** the next time a feature adds an annotation-driven sink and nobody updates
+the list.
 
 ## Principles (P1–P5)
 
@@ -56,7 +56,7 @@ All of the following is implemented and wired in this PR:
   allowlist of checkpoint annotations (`io.kubernetes.*` bookkeeping); the live
   request is authoritative, everything else is dropped (and logged). Allowlist,
   not denylist: a forgotten key fails *closed* (visible restore regression in
-  tests) rather than *open* (silent re-trust → CVE). One chokepoint protects every
+  tests) rather than *open* (silent re-trust). One chokepoint protects every
   downstream consumer (CDI, NRI, blockIO/RDT, restart monitor) at once.
 - **rebind (P2/P4)** — `Restorer.RebindSpec` runs during `createContainer` spec
   build, after `buildContainerSpec`, so registered `Rebinder`s re-acquire
@@ -87,13 +87,13 @@ image vs policy metadata as separately-trusted objects, and decide
 "verify-before-unpack" (today metadata must be unpacked to a temp mount before it
 can be validated at all).
 
-## Why this is worth doing properly (beyond the CVE)
+## Why this is worth doing properly (beyond the boundary)
 
-The boundary that closes the smuggling class — *re-allocate and rebind instead of
-replay* — is the same primitive that unlocks:
+The boundary — *re-allocate and rebind instead of replay* — is the same primitive
+that unlocks:
 
 - **Device re-binding** — restore re-acquires GPUs/accelerators through DRA/
-  device-plugin (correct behavior *and* the security fix).
+  device-plugin (the correct behavior, which is also what the boundary requires).
 - **Live migration** — restore on a new node + rebind network/identity; the
   orchestrator expresses preserve-vs-rebind and a compatibility gate before
   committing downtime.
@@ -106,7 +106,7 @@ One Restore API, three payoffs.
 
 1. **Restore is now opt-in** (`enable_checkpoint_restore = false` by default).
    Operators using restore-from-checkpoint must set the flag. Fail closed is the
-   point: the implicit path is the vulnerability class.
+   point: the implicit path is the re-trust this PR removes.
 2. **Checkpoint annotations outside `io.kubernetes.*` are dropped.** Source
    analysis of every annotation consumer on the restore path:
 
@@ -116,7 +116,7 @@ One Restore API, three payoffs.
 | `io.kubernetes.container.*`, `io.kubernetes.pod.*` | kubelet create request + allowlisted | **safe** |
 | `restored` / `checkpointedAt` / `checkpointImage` | added by containerd *after* sanitize | **safe** |
 | `cdi.k8s.io/*` (legit) | kubelet via create request or `CDIDevices` field | **safe if** kubelet re-supplies (likely; `CDIDevices` compensates) |
-| `cdi.k8s.io/*`, `devices.nri.io/*`, `containerd.io/restart.*` (smuggled) | checkpoint only | **dropped — security win** |
+| `cdi.k8s.io/*`, `devices.nri.io/*`, `containerd.io/restart.*` (checkpoint-origin) | checkpoint only | **dropped** |
 | `blockio.resources.beta.kubernetes.io/*` | kubelet create request **or** checkpoint | **regression risk** — dropped; QoS class lost if kubelet doesn't re-supply |
 | `rdt.resources.beta.kubernetes.io/*` | same | **regression risk** — same |
 | operator `ContainerAnnotations` passthrough | kubelet create request | **regression risk** — dropped if non-`io.kubernetes.*` and not re-supplied |
@@ -133,7 +133,7 @@ kubelet-trusted) prefixes to the allowlist.
 - [ ] same for `rdt.resources.beta.kubernetes.io/container.X`.
 - [ ] CDI: restore a checkpoint that requested a device; assert it is **not** injected unless the live request asked via `CDIDevices` / `cdi.k8s.io/*`.
 - [ ] operator `container_annotations = ["custom.io/*"]`: checkpoint+restore; assert round-trip or document the limitation.
-- [ ] smuggle: checkpoint with `cdi.k8s.io/`, `devices.nri.io/`, `containerd.io/restart.loguri`; assert all dropped end-to-end.
+- [ ] checkpoint-origin device keys: checkpoint with `cdi.k8s.io/`, `devices.nri.io/`, `containerd.io/restart.loguri`; assert all dropped end-to-end.
 
 ## Scope of this PR
 

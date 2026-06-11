@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-// Package restore defines a first-class, security-bounded API surface for
+// Package restore defines a first-class, trust-bounded API surface for
 // restoring containers from checkpoints, kept deliberately separate from the
 // normal container-create path.
 //
@@ -22,12 +22,12 @@
 //
 // Today, restore is an implicit branch of CreateContainer: containerd detects a
 // checkpoint-annotated image and re-emits a create request built from
-// attacker-authored checkpoint metadata (status.dump / config.dump), feeding it
+// checkpoint-authored metadata (status.dump / config.dump), feeding it
 // back into the pipeline otherwise reserved for kubelet-validated input. That one
-// decision turns untrusted archive bytes into trusted CRI inputs, which is the
-// root cause behind the CDI annotation-smuggling class (and the same re-trust
-// reaches other annotation-driven sinks: NRI plugins, snapshot id-map labels,
-// the restart-monitor log URI, blockIO/RDT class selection).
+// decision turns untrusted archive bytes into trusted CRI inputs, so
+// checkpoint-origin values reach runtime sinks that should be driven only by the
+// live request: CDI device selection, NRI plugins, snapshot id-map labels,
+// the restart-monitor log URI, blockIO/RDT class selection.
 //
 // # Design (two phase)
 //
@@ -61,7 +61,7 @@
 // RPC so the orchestrator can declare intent and policy (preserve vs rebind
 // network identity, device re-allocation strategy, trust posture), and so the
 // same primitive can back live migration and warm-start ("restore many from one
-// snapshot"). The unifying property is the same as the security fix:
+// snapshot"). The unifying property is the same as in phase 1:
 // re-allocate and rebind instead of replay.
 //
 // Phase 1 is implemented and wired: CreateContainer gates restore behind the

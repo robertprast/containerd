@@ -106,7 +106,7 @@ func TestPrepareWithMetadataValidator(t *testing.T) {
 	good := validCheckpoint()
 	good.Annotations = map[string]string{
 		"io.kubernetes.container.hash": "h",
-		"cdi.k8s.io/gpu":               "evil.com/gpu=all",
+		"cdi.k8s.io/gpu":               "example.com/gpu=all",
 	}
 	res, err := r.Prepare(ctx, good, nil)
 	if err != nil {
@@ -116,7 +116,7 @@ func TestPrepareWithMetadataValidator(t *testing.T) {
 		t.Errorf("bookkeeping annotation lost: %v", res.Annotations)
 	}
 	if _, ok := res.Annotations["cdi.k8s.io/gpu"]; ok {
-		t.Errorf("smuggled CDI annotation survived: %v", res.Annotations)
+		t.Errorf("checkpoint-origin CDI annotation survived: %v", res.Annotations)
 	}
 
 	bad := validCheckpoint()

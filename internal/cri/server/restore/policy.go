@@ -30,7 +30,7 @@ import (
 // extend the denylist, the checkpoint silently re-trusts it. An allowlist fails
 // CLOSED: an unknown checkpoint annotation is dropped, and the only failure mode
 // is that a legitimately-needed bookkeeping key was forgotten -- which surfaces
-// loudly as a restore/round-trip regression in tests, not as a silent CVE.
+// loudly as a restore/round-trip regression in tests, not as a silent re-trust.
 type AnnotationPolicy struct {
 	// Allow lists annotation keys restored from the checkpoint. Each entry is
 	// either an exact key, or a prefix written with a trailing "*". Anything not
@@ -50,8 +50,8 @@ type AnnotationPolicy struct {
 //	blockio.resources.beta.kubernetes.io/*   (blockIO class)
 //	rdt.resources.beta.kubernetes.io/*       (RDT class)
 //
-// so this allowlist closes the smuggling class while staying behavior-preserving
-// for the kubelet's metadata.
+// so this allowlist keeps every one of those sinks driven only by the live
+// request, while staying behavior-preserving for the kubelet's metadata.
 //
 // KNOWN COMPATIBILITY RISK (settle via integration test before relying on this):
 // some legitimate, operator-facing features key off annotations that are NOT

@@ -265,7 +265,7 @@ func (c *criService) CRImportCheckpoint(
 	// - sanitize: create-request annotations are authoritative and only the
 	//   kubelet's own (io.kubernetes.*) bookkeeping keys are restored from the
 	//   checkpoint -- which subsumes the old manual hash/restartCount fixup.
-	//   This drops smuggled runtime-affecting annotations (cdi.k8s.io/,
+	//   This drops checkpoint-origin runtime-affecting annotations (cdi.k8s.io/,
 	//   devices.nri.io/, containerd.io/restart.*, blockio/rdt classes, ...) at a
 	//   single chokepoint, protecting every downstream consumer (CDI, NRI,
 	//   blockIO/RDT, restart monitor) instead of each sink defending itself.

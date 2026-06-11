@@ -34,7 +34,7 @@ type Checkpoint struct {
 	// ImageRef is the user-specified checkpoint image or archive reference.
 	ImageRef string
 	// Annotations are the annotations recorded in the checkpoint (status.dump).
-	// These are attacker-authored and MUST NOT be trusted; they are passed
+	// These are checkpoint-authored and MUST NOT be trusted; they are passed
 	// through [SanitizeAnnotations] before reaching any container config.
 	Annotations map[string]string
 	// Config is the checkpoint's config.dump metadata (base image refs,
@@ -75,8 +75,8 @@ type Validator interface {
 // Rebinder re-acquires a resource (device, network identity, credentials)
 // through the normal allocation path at restore time, instead of replaying the
 // state recorded in the checkpoint. Re-binding rather than replaying is both the
-// correct behavior for migration/warm-start and the security boundary that stops
-// a checkpoint from smuggling host resources.
+// correct behavior for migration/warm-start and the trust boundary that stops a
+// checkpoint from asserting host resources it was never granted.
 type Rebinder interface {
 	// Name identifies the rebinder in error messages.
 	Name() string
@@ -141,8 +141,8 @@ type Result struct {
 	// container (create-request base + allowlisted checkpoint keys).
 	Annotations map[string]string
 	// DroppedAnnotations lists checkpoint annotation keys denied by policy.
-	// Callers should log these for audit (e.g. a denied cdi.k8s.io/* key is a
-	// signal someone tried to smuggle a device request through restore).
+	// Callers should log these for audit (e.g. a denied cdi.k8s.io/* key means
+	// the checkpoint asserted a device request the live request did not).
 	DroppedAnnotations []string
 }
 
